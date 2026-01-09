@@ -52,10 +52,20 @@
 #    o_src = attn_src._apply_to_o(o_src)
 
 from functools import partial
-from typing import Callable, Optional, Tuple, List
+from typing import Callable, Optional, Tuple, List, Protocol
 
 import torch
 import torch.nn.functional as F
+
+
+class KVCacheProtocol(Protocol):
+    """Minimal protocol for KV cache managers (e.g., FlashAttentionRope)."""
+
+    def update(self, new_k: torch.Tensor, new_v: torch.Tensor) -> None:
+        ...
+
+    def get(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        ...
 
 
 class PropeDotProductAttention(torch.nn.Module):
@@ -77,11 +87,11 @@ class PropeDotProductAttention(torch.nn.Module):
         freq_scale: float = 1.0,
     ):
         super().__init__()
-        self.head_dim = head_dim
-        self.patches_x = patches_x
-        self.patches_y = patches_y
-        self.image_width = image_width
-        self.image_height = image_height
+        self.head_dim = head_dim  # type: ignore[assignment]
+        self.patches_x = patches_x  # type: ignore[assignment]
+        self.patches_y = patches_y  # type: ignore[assignment]
+        self.image_width = image_width  # type: ignore[assignment]
+        self.image_height = image_height  # type: ignore[assignment]
 
         coeffs_x: Tuple[torch.Tensor, torch.Tensor] = _rope_precompute_coeffs(
             torch.tile(torch.arange(patches_x), (patches_y,)),
@@ -102,7 +112,7 @@ class PropeDotProductAttention(torch.nn.Module):
         self.register_buffer("coeffs_y_1", coeffs_y[1], persistent=False)
 
     # override load_state_dict to not load coeffs if they exist (for backward compatibility)
-    def load_state_dict(self, state_dict, strict=True):
+    def load_state_dict(self, state_dict, strict=True):  # type: ignore[override]
         # remove coeffs from state_dict
         state_dict.pop("coeffs_x_0", None)
         state_dict.pop("coeffs_x_1", None)
@@ -117,6 +127,7 @@ class PropeDotProductAttention(torch.nn.Module):
         v: torch.Tensor,  # (batch, num_heads, seqlen, head_dim)
         viewmats: torch.Tensor,  # (batch, cameras, 4, 4)
         Ks: Optional[torch.Tensor],  # (batch, cameras, 3, 3)
+        kv_cache_manager: Optional[KVCacheProtocol] = None,
         **kwargs,
     ) -> torch.Tensor:
         return prope_dot_product_attention(
@@ -131,6 +142,7 @@ class PropeDotProductAttention(torch.nn.Module):
             image_height=self.image_height,
             coeffs_x=(self.coeffs_x_0, self.coeffs_x_1),
             coeffs_y=(self.coeffs_y_0, self.coeffs_y_1),
+            kv_cache_manager=kv_cache_manager,
             **kwargs,
         )
 
@@ -140,9 +152,9 @@ class PropeDotProductAttention(torch.nn.Module):
         (batch, cameras, _, _) = viewmats.shape
         assert viewmats.shape == (batch, cameras, 4, 4)
         assert Ks is None or Ks.shape == (batch, cameras, 3, 3)
-        self.cameras = cameras
+        self.cameras = cameras  # type: ignore[assignment]
 
-        self.apply_fn_q, self.apply_fn_kv, self.apply_fn_o = _prepare_apply_fns(
+        apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns(
             head_dim=self.head_dim,
             viewmats=viewmats,
             Ks=Ks,
@@ -153,6 +165,9 @@ class PropeDotProductAttention(torch.nn.Module):
             coeffs_x=(self.coeffs_x_0, self.coeffs_x_1),
             coeffs_y=(self.coeffs_y_0, self.coeffs_y_1),
         )
+        self.apply_fn_q = apply_fn_q  # type: ignore[assignment]
+        self.apply_fn_kv = apply_fn_kv  # type: ignore[assignment]
+        self.apply_fn_o = apply_fn_o  # type: ignore[assignment]
 
     def _apply_to_q(self, q: torch.Tensor) -> torch.Tensor:
         (batch, num_heads, seqlen, head_dim) = q.shape
@@ -192,6 +207,7 @@ def prope_dot_product_attention(
     image_height: int,  # Height of the image. Used to normalize intrinsics.
     coeffs_x: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     coeffs_y: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    kv_cache_manager: Optional[KVCacheProtocol] = None,
     **kwargs,
 ) -> torch.Tensor:
     """Similar to torch.nn.functional.scaled_dot_product_attention, but applies PRoPE-style
@@ -224,10 +240,20 @@ def prope_dot_product_attention(
         coeffs_y=coeffs_y,
     )
 
+    q = apply_fn_q(q)
+    k = apply_fn_kv(k)
+    v = apply_fn_kv(v)
+
+    # When a KV cache is provided (e.g., FlashAttentionRope's KVCacheManager),
+    # we cache the already-transformed keys/values to avoid recomputation.
+    if kv_cache_manager is not None:
+        kv_cache_manager.update(new_k=k, new_v=v)
+        k, v = kv_cache_manager.get()
+
     out = F.scaled_dot_product_attention(
-        query=apply_fn_q(q),
-        key=apply_fn_kv(k),
-        value=apply_fn_kv(v),
+        query=q,
+        key=k,
+        value=v,
         **kwargs,
     )
     out = apply_fn_o(out)
@@ -243,8 +269,8 @@ def _prepare_apply_fns(
     patches_y: int,  # How many patches tall is each image?
     image_width: int,  # Width of the image. Used to normalize intrinsics.
     image_height: int,  # Height of the image. Used to normalize intrinsics.
-    coeffs_x: Optional[torch.Tensor] = None,
-    coeffs_y: Optional[torch.Tensor] = None,
+    coeffs_x: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    coeffs_y: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[
     Callable[[torch.Tensor], torch.Tensor],
     Callable[[torch.Tensor], torch.Tensor],
