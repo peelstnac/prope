@@ -179,6 +179,64 @@ class PropeDotProductAttention(torch.nn.Module):
         return self.apply_fn_o(o)
 
 
+# def prope_dot_product_attention(
+#     q: torch.Tensor,  # (batch, num_heads, seqlen, head_dim)
+#     k: torch.Tensor,  # (batch, num_heads, seqlen, head_dim)
+#     v: torch.Tensor,  # (batch, num_heads, seqlen, head_dim)
+#     *,
+#     viewmats: torch.Tensor,  # (batch, cameras, 4, 4)
+#     Ks: Optional[torch.Tensor],  # (batch, cameras, 3, 3)
+#     patches_x: int,  # How many patches wide is each image?
+#     patches_y: int,  # How many patches tall is each image?
+#     image_width: int,  # Width of the image. Used to normalize intrinsics.
+#     image_height: int,  # Height of the image. Used to normalize intrinsics.
+#     coeffs_x: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+#     coeffs_y: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+#     **kwargs,
+# ) -> torch.Tensor:
+#     """Similar to torch.nn.functional.scaled_dot_product_attention, but applies PRoPE-style
+#     positional encoding.
+
+#     Currently, we assume that the sequence length is equal to:
+
+#         cameras * patches_x * patches_y
+
+#     And token ordering allows the `(seqlen,)` axis to be reshaped into
+#     `(cameras, patches_x, patches_y)`.
+#     """
+#     # We're going to assume self-attention: all inputs are the same shape.
+#     (batch, num_heads, seqlen, head_dim) = q.shape
+#     cameras = viewmats.shape[1]
+#     assert q.shape == k.shape == v.shape
+#     assert viewmats.shape == (batch, cameras, 4, 4)
+#     assert Ks is None or Ks.shape == (batch, cameras, 3, 3)
+#     assert seqlen == cameras * patches_x * patches_y
+
+#     apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns(
+#         head_dim=head_dim,
+#         viewmats=viewmats,
+#         Ks=Ks,
+#         patches_x=patches_x,
+#         patches_y=patches_y,
+#         image_width=image_width,
+#         image_height=image_height,
+#         coeffs_x=coeffs_x,
+#         coeffs_y=coeffs_y,
+#     )
+
+#     out = F.scaled_dot_product_attention(
+#         query=apply_fn_q(q),
+#         key=apply_fn_kv(k),
+#         value=apply_fn_kv(v),
+#         **kwargs,
+#     )
+#     out = apply_fn_o(out)
+#     assert out.shape == (batch, num_heads, seqlen, head_dim)
+#     return out
+
+
+# From https://github.com/liruilong940607/prope/issues/7#issuecomment-3110656407
+# Allows for register tokens to be APPENDED AT THE END OF THE ENTIRE SEQUENCE
 def prope_dot_product_attention(
     q: torch.Tensor,  # (batch, num_heads, seqlen, head_dim)
     k: torch.Tensor,  # (batch, num_heads, seqlen, head_dim)
@@ -210,8 +268,7 @@ def prope_dot_product_attention(
     assert q.shape == k.shape == v.shape
     assert viewmats.shape == (batch, cameras, 4, 4)
     assert Ks is None or Ks.shape == (batch, cameras, 3, 3)
-    assert seqlen == cameras * patches_x * patches_y
-
+    assert seqlen >= cameras * patches_x * patches_y
     apply_fn_q, apply_fn_kv, apply_fn_o = _prepare_apply_fns(
         head_dim=head_dim,
         viewmats=viewmats,
@@ -223,16 +280,19 @@ def prope_dot_product_attention(
         coeffs_x=coeffs_x,
         coeffs_y=coeffs_y,
     )
+    q = torch.cat([apply_fn_q(q[:, :, :cameras * patches_x * patches_y, :]), q[:, :, cameras * patches_x * patches_y:, :]], dim=2)
+    k = torch.cat([apply_fn_kv(k[:, :, :cameras * patches_x * patches_y, :]), k[:, :, cameras * patches_x * patches_y:, :]], dim=2)
+    v = torch.cat([apply_fn_kv(v[:, :, :cameras * patches_x * patches_y, :]), v[:, :, cameras * patches_x * patches_y:, :]], dim=2)
 
     out = F.scaled_dot_product_attention(
-        query=apply_fn_q(q),
-        key=apply_fn_kv(k),
-        value=apply_fn_kv(v),
+        query=q,
+        key=k,
+        value=v,
         **kwargs,
     )
-    out = apply_fn_o(out)
-    assert out.shape == (batch, num_heads, seqlen, head_dim)
-    return out
+    res = apply_fn_o(out[:, :, :cameras * patches_x * patches_y, :])
+    assert res.shape == (batch, num_heads, cameras * patches_x * patches_y, head_dim)
+    return torch.cat([res[:, :, :cameras * patches_x * patches_y, :], out[:, :, cameras * patches_x * patches_y:, :]], dim=2)
 
 
 def _prepare_apply_fns(
